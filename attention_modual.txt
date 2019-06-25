@@ -1,0 +1,625 @@
+#Dual Attention NetWork---------------------------------------------------------------------------------------------------------
+class PAM_Module(Module):
+    """ Position attention module"""
+    #Ref from SAGAN
+    def __init__(self, in_dim):
+        super(PAM_Module, self).__init__()
+        self.chanel_in = in_dim
+
+        self.query_conv = Conv2d(in_channels=in_dim, out_channels=in_dim//8, kernel_size=1)
+        self.key_conv = Conv2d(in_channels=in_dim, out_channels=in_dim//8, kernel_size=1)
+        self.value_conv = Conv2d(in_channels=in_dim, out_channels=in_dim, kernel_size=1)
+        self.gamma = Parameter(torch.zeros(1))
+
+        self.softmax = Softmax(dim=-1)
+    def forward(self, x):
+        """
+            inputs :
+                x : input feature maps( B X C X H X W)
+            returns :
+                out : attention value + input feature
+                attention: B X (HxW) X (HxW)
+        """
+        m_batchsize, C, height, width = x.size()
+        proj_query = self.query_conv(x).view(m_batchsize, -1, width*height).permute(0, 2, 1) # reshape  to (m_batchsize, width*height, c)
+        proj_key = self.key_conv(x).view(m_batchsize, -1, width*height)
+        energy = torch.bmm(proj_query, proj_key) # 矩阵乘法
+        attention = self.softmax(energy) # 添加非线性函数
+        proj_value = self.value_conv(x).view(m_batchsize, -1, width*height)
+
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        out = out.view(m_batchsize, C, height, width) # reshape到原图
+
+        out = self.gamma*out + x # 相加
+        return out
+
+
+class CAM_Module(Module):
+    """ Channel attention module"""
+    def __init__(self, in_dim):
+        super(CAM_Module, self).__init__()
+        self.chanel_in = in_dim
+
+
+        self.gamma = Parameter(torch.zeros(1))
+        self.softmax  = Softmax(dim=-1)
+    def forward(self,x):
+        """
+            inputs :
+                x : input feature maps( B X C X H X W)
+            returns :
+                out : attention value + input feature
+                attention: B X C X C
+        """
+        m_batchsize, C, height, width = x.size()
+        proj_query = x.view(m_batchsize, C, -1)
+        proj_key = x.view(m_batchsize, C, -1).permute(0, 2, 1)
+        energy = torch.bmm(proj_query, proj_key)
+        energy_new = torch.max(energy, -1, keepdim=True)[0].expand_as(energy)-energy
+        attention = self.softmax(energy_new)
+        proj_value = x.view(m_batchsize, C, -1)
+
+        out = torch.bmm(attention, proj_value)
+        out = out.view(m_batchsize, C, height, width)
+
+        out = self.gamma*out + x
+        return out
+class DANetHead(nn.Module):
+    def __init__(self, in_channels, out_channels, norm_layer):
+        super(DANetHead, self).__init__()
+        inter_channels = in_channels // 4
+        self.conv5a = nn.Sequential(nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
+                                   norm_layer(inter_channels),
+                                   nn.ReLU())
+        
+        self.conv5c = nn.Sequential(nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
+                                   norm_layer(inter_channels),
+                                   nn.ReLU())
+
+        self.sa = PAM_Module(inter_channels)
+        self.sc = CAM_Module(inter_channels)
+        self.conv51 = nn.Sequential(nn.Conv2d(inter_channels, inter_channels, 3, padding=1, bias=False),
+                                   norm_layer(inter_channels),
+                                   nn.ReLU())
+        self.conv52 = nn.Sequential(nn.Conv2d(inter_channels, inter_channels, 3, padding=1, bias=False),
+                                   norm_layer(inter_channels),
+                                   nn.ReLU())
+
+        self.conv6 = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(512, out_channels, 1))
+        self.conv7 = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(512, out_channels, 1))
+
+        self.conv8 = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(512, out_channels, 1))
+
+    def forward(self, x):
+        feat1 = self.conv5a(x)
+        sa_feat = self.sa(feat1)
+        sa_conv = self.conv51(sa_feat)
+        sa_output = self.conv6(sa_conv)
+
+        feat2 = self.conv5c(x)
+        sc_feat = self.sc(feat2)
+        sc_conv = self.conv52(sc_feat)
+        sc_output = self.conv7(sc_conv)
+
+        feat_sum = sa_conv+sc_conv
+        
+        sasc_output = self.conv8(feat_sum)
+
+        output = [sasc_output]
+        output.append(sa_output)
+        output.append(sc_output)
+        return tuple(output)
+
+#CBAM ---------------------------------------------------------------------------------------------------------------
+"""
+@Time   : 2018/10/19
+@Author : Li YongHong
+@Email  : lyh_robert@163.com
+@File   : test.py
+"""
+import tensorflow as tf
+import numpy as np
+
+slim = tf.contrib.slim
+
+def combined_static_and_dynamic_shape(tensor):
+  """Returns a list containing static and dynamic values for the dimensions.
+
+  Returns a list of static and dynamic values for shape dimensions. This is
+  useful to preserve static shapes when available in reshape operation.
+
+  Args:
+    tensor: A tensor of any type.
+
+  Returns:
+    A list of size tensor.shape.ndims containing integers or a scalar tensor.
+  """
+  static_tensor_shape = tensor.shape.as_list()
+  dynamic_tensor_shape = tf.shape(tensor)
+  combined_shape = []
+  for index, dim in enumerate(static_tensor_shape):
+    if dim is not None:
+      combined_shape.append(dim)
+    else:
+      combined_shape.append(dynamic_tensor_shape[index])
+  return combined_shape
+
+def convolutional_block_attention_module(feature_map, index, inner_units_ratio=0.5):
+    """
+    CBAM: convolution block attention module, which is described in "CBAM: Convolutional Block Attention Module"
+    Architecture : "https://arxiv.org/pdf/1807.06521.pdf"
+    If you want to use this module, just plug this module into your network
+    :param feature_map : input feature map
+    :param index : the index of convolution block attention module
+    :param inner_units_ratio: output units number of fully connected layer: inner_units_ratio*feature_map_channel
+    :return:feature map with channel and spatial attention
+    """
+    with tf.variable_scope("cbam_%s" % (index)):
+        feature_map_shape = combined_static_and_dynamic_shape(feature_map)
+        # channel attention
+        channel_avg_weights = tf.nn.avg_pool(
+            value=feature_map,
+            ksize=[1, feature_map_shape[1], feature_map_shape[2], 1],
+            strides=[1, 1, 1, 1],
+            padding='VALID'
+        )
+        channel_max_weights = tf.nn.max_pool(
+            value=feature_map,
+            ksize=[1, feature_map_shape[1], feature_map_shape[2], 1],
+            strides=[1, 1, 1, 1],
+            padding='VALID'
+        )
+        channel_avg_reshape = tf.reshape(channel_avg_weights,
+                                         [feature_map_shape[0], 1, feature_map_shape[3]])
+        channel_max_reshape = tf.reshape(channel_max_weights,
+                                         [feature_map_shape[0], 1, feature_map_shape[3]])
+        channel_w_reshape = tf.concat([channel_avg_reshape, channel_max_reshape], axis=1)
+
+        fc_1 = tf.layers.dense(
+            inputs=channel_w_reshape,
+            units=feature_map_shape[3] * inner_units_ratio,
+            name="fc_1",
+            activation=tf.nn.relu
+        )
+        fc_2 = tf.layers.dense(
+            inputs=fc_1,
+            units=feature_map_shape[3],
+            name="fc_2",
+            activation=None
+        )
+        channel_attention = tf.reduce_sum(fc_2, axis=1, name="channel_attention_sum")
+        channel_attention = tf.nn.sigmoid(channel_attention, name="channel_attention_sum_sigmoid")
+        channel_attention = tf.reshape(channel_attention, shape=[feature_map_shape[0], 1, 1, feature_map_shape[3]])
+        feature_map_with_channel_attention = tf.multiply(feature_map, channel_attention)
+        # spatial attention
+        channel_wise_avg_pooling = tf.reduce_mean(feature_map_with_channel_attention, axis=3)
+        channel_wise_max_pooling = tf.reduce_max(feature_map_with_channel_attention, axis=3)
+
+        channel_wise_avg_pooling = tf.reshape(channel_wise_avg_pooling,
+                                              shape=[feature_map_shape[0], feature_map_shape[1], feature_map_shape[2],
+                                                     1])
+        channel_wise_max_pooling = tf.reshape(channel_wise_max_pooling,
+                                              shape=[feature_map_shape[0], feature_map_shape[1], feature_map_shape[2],
+                                                     1])
+
+        channel_wise_pooling = tf.concat([channel_wise_avg_pooling, channel_wise_max_pooling], axis=3)
+        spatial_attention = slim.conv2d(
+            channel_wise_pooling,
+            1,
+            [7, 7],
+            padding='SAME',
+            activation_fn=tf.nn.sigmoid,
+            scope="spatial_attention_conv"
+        )
+        feature_map_with_attention = tf.multiply(feature_map_with_channel_attention, spatial_attention)
+        return feature_map_with_attention
+
+#example
+feature_map = tf.constant(np.random.rand(2,8,8,32), dtype=tf.float16)
+feature_map_with_attention = convolutional_block_attention_module(feature_map, 1)
+
+with tf.Session() as sess:
+    init = tf.global_variables_initializer()
+    sess.run(init)
+    result = sess.run(feature_map_with_attention)
+    print(result.shape)
+
+#CAMB Attention-----------------------------------------------------------------------------------------------------------
+
+
+def cbam_module(inputs,reduction_ratio=0.5,name=""):
+
+    with tf.variable_scope("cbam_"+name, reuse=tf.AUTO_REUSE):
+
+        #假如输入是[batsize,h,w,channel]，
+
+        #channel attension 因为要得到batsize * 1 * 1 * channel，它的全连接层第一层
+
+      #隐藏层单元个数是channel / r, 第二层是channel，所以这里把channel赋值给hidden_num
+
+        batch_size,hidden_num=inputs.get_shape().as_list()[0],inputs.get_shape().as_list()[3]
+
+ 
+
+       #通道attension
+
+        #全局最大池化，窗口大小为h * w，所以对于这个数据[batsize,h,w,channel]，他其实是求每个h * w面积的最大值
+
+      #这里实现是先对h这个维度求最大值，然后对w这个维度求最大值，平均池化也一样
+
+        maxpool_channel=tf.reduce_max(tf.reduce_max(inputs,axis=1,keepdims=True),axis=2,keepdims=True)
+
+        avgpool_channel=tf.reduce_mean(tf.reduce_mean(inputs,axis=1,keepdims=True),axis=2,keepdims=True)
+
+        
+
+        #上面全局池化结果为batsize * 1 * 1 * channel，它这个拉平输入到全连接层
+
+      #这个拉平，它会保留batsize，所以结果是[batsize,channel]
+
+        maxpool_channel = tf.layers.Flatten()(maxpool_channel)
+
+        avgpool_channel = tf.layers.Flatten()(avgpool_channel)
+
+        
+
+        #将上面拉平后结果输入到全连接层，第一个全连接层hiddensize = channel/r = channel * reduction_ratio，
+
+      #第二哥全连接层hiddensize = channel
+
+        mlp_1_max=tf.layers.dense(inputs=maxpool_channel,units=int(hidden_num*reduction_ratio),name="mlp_1",reuse=None,activation=tf.nn.relu)
+
+        mlp_2_max=tf.layers.dense(inputs=mlp_1_max,units=hidden_num,name="mlp_2",reuse=None)
+
+        #全连接层输出结果为[batsize,channel]，这里又降它转回到原来维度batsize * 1 * 1 * channel，
+
+       mlp_2_max=tf.reshape(mlp_2_max,[batch_size,1,1,hidden_num])
+
+ 
+
+        mlp_1_avg=tf.layers.dense(inputs=avgpool_channel,units=int(hidden_num*reduction_ratio),name="mlp_1",reuse=True,activation=tf.nn.relu)
+
+        mlp_2_avg=tf.layers.dense(inputs=mlp_1_avg,units=hidden_num,name="mlp_2",reuse=True)
+
+        mlp_2_avg=tf.reshape(mlp_2_avg,[batch_size,1,1,hidden_num])
+
+ 
+
+        #将平均和最大池化的结果维度都是[batch_size,1,1,channel]相加，然后进行sigmod，维度不变
+
+        channel_attention=tf.nn.sigmoid(mlp_2_max+mlp_2_avg)
+
+         #和最开始的inputs相乘，相当于[batch_size,1,1,channel] * [batch_size,h,w,channel]
+
+       #只有维度一样才能相乘,这里相乘相当于给每个通道作用了不同的权重
+
+        channel_refined_feature=inputs*channel_attention
+
+ 
+
+       
+
+        #空间attension
+
+        #上面得到的结果维度依然是[batch_size,h,w,channel]，
+
+      #下面要进行全局通道池化，其实就是一条通道里面那个通道的值最大，其实就是对channel这个维度求最大值
+
+      #每个通道池化相当于将通道压缩到了1维，有两个池化，结果为两个[batch_size,h,w,1]feature map
+
+        maxpool_spatial=tf.reduce_max(inputs,axis=3,keepdims=True)
+
+        avgpool_spatial=tf.reduce_mean(inputs,axis=3,keepdims=True)
+
+ 
+
+        #将两个[batch_size,h,w,1]的feature map进行通道合并得到[batch_size,h,w,2]的feature map
+
+        max_avg_pool_spatial=tf.concat([maxpool_spatial,avgpool_spatial],axis=3)
+
+ 
+
+       #然后对上面的feature map用1个7*7的卷积核进行卷积得到[batch_size,h,w,1]的feature map，因为是用一个卷积核卷的
+
+     #所以将2个输入通道压缩到了1个输出通道
+
+        conv_layer=tf.layers.conv2d(inputs=max_avg_pool_spatial, filters=1, kernel_size=(7, 7), padding="same", activation=None)
+
+      #然后再对上面得到的[batch_size,h,w,1]feature map进行sigmod，这里为什么要用一个卷积核压缩到1个通道，相当于只得到了一个面积的值
+
+     #然后进行sigmod，因为我们要求的就是feature map面积上不同位置像素的中重要性，所以它压缩到了一个通道，然后求sigmod
+
+        spatial_attention=tf.nn.sigmoid(conv_layer)
+
+ 
+
+       #上面得到了空间attension feature map [batch_size,h,w,1]，然后再用这个和经过空间attension作用的结果相乘得到最终的结果
+
+     #这个结果就是经过通道和空间attension共同作用的结果
+
+        refined_feature=channel_refined_feature*spatial_attention
+
+ 
+
+    return refined_feature
+#CBAM--------------------------------------------------------------------------------------------------------------------------
+def cbam_block(input_feature, name, ratio=8):
+    """Contains the implementation of Convolutional Block Attention Module(CBAM) block.
+    As described in https://arxiv.org/abs/1807.06521.
+    """
+
+    with tf.variable_scope(name):
+        scale,attention_feature = channel_attention(input_feature, 'ch_at', ratio)
+        concat,attention_feature = spatial_attention(attention_feature, 'sp_at')
+    return concat,scale,attention_feature
+
+
+def channel_attention(input_feature, name, ratio=8):
+    kernel_initializer = tf.contrib.layers.variance_scaling_initializer()
+    bias_initializer = tf.constant_initializer(value=0.0)
+
+    with tf.variable_scope(name):
+        channel = input_feature.get_shape()[-1]
+        avg_pool = tf.reduce_mean(input_feature, axis=[1, 2], keep_dims=True)
+
+        assert avg_pool.get_shape()[1:] == (1, 1, channel)
+        avg_pool = tf.layers.dense(inputs=avg_pool,
+                                   units=channel // ratio,
+                                   activation=tf.nn.relu,
+                                   kernel_initializer=kernel_initializer,
+                                   bias_initializer=bias_initializer,
+                                   name='mlp_0',
+                                   reuse=None)
+        assert avg_pool.get_shape()[1:] == (1, 1, channel // ratio)
+        avg_pool = tf.layers.dense(inputs=avg_pool,
+                                   units=channel,
+                                   kernel_initializer=kernel_initializer,
+                                   bias_initializer=bias_initializer,
+                                   name='mlp_1',
+                                   reuse=None)
+        assert avg_pool.get_shape()[1:] == (1, 1, channel)
+
+        max_pool = tf.reduce_max(input_feature, axis=[1, 2], keep_dims=True)
+        assert max_pool.get_shape()[1:] == (1, 1, channel)
+        max_pool = tf.layers.dense(inputs=max_pool,
+                                   units=channel // ratio,
+                                   activation=tf.nn.relu,
+                                   name='mlp_0',
+                                   reuse=True)
+        assert max_pool.get_shape()[1:] == (1, 1, channel // ratio)
+        max_pool = tf.layers.dense(inputs=max_pool,
+                                   units=channel,
+                                   name='mlp_1',
+                                   reuse=True)
+        assert max_pool.get_shape()[1:] == (1, 1, channel)
+        scale = tf.sigmoid(avg_pool + max_pool, 'sigmoid')
+
+
+    return scale,input_feature * scale
+
+
+def spatial_attention(input_feature, name):
+    kernel_size = 7
+    kernel_initializer = tf.contrib.layers.variance_scaling_initializer()
+    with tf.variable_scope(name):
+        avg_pool = tf.reduce_mean(input_feature, axis=[3], keep_dims=True)
+        assert avg_pool.get_shape()[-1] == 1
+        max_pool = tf.reduce_max(input_feature, axis=[3], keep_dims=True)
+        assert max_pool.get_shape()[-1] == 1
+        concat = tf.concat([avg_pool, max_pool], 3)
+        assert concat.get_shape()[-1] == 2
+
+        concat = tf.layers.conv2d(concat,
+                                  filters=1,
+                                  kernel_size=[kernel_size, kernel_size],
+                                  strides=[1, 1],
+                                  padding="same",
+                                  activation=None,
+                                  kernel_initializer=kernel_initializer,
+                                  use_bias=False,
+                                  name='conv')
+        assert concat.get_shape()[-1] == 1
+        concat = tf.sigmoid(concat, 'sigmoid')
+
+
+    return concat,input_feature * concat
+
+
+#Self Attention GAN-------------------------------------------------------------------------------------------------
+def attention(self, x, ch, sn=False, scope='attention', reuse=False):
+        with tf.variable_scope(scope, reuse=reuse):
+            f = conv(x, ch // 8, kernel=1, stride=1, sn=sn, scope='f_conv') # [bs, h, w, c']
+            g = conv(x, ch // 8, kernel=1, stride=1, sn=sn, scope='g_conv') # [bs, h, w, c']
+            h = conv(x, ch, kernel=1, stride=1, sn=sn, scope='h_conv') # [bs, h, w, c]
+
+            # N = h * w
+            s = tf.matmul(hw_flatten(g), hw_flatten(f), transpose_b=True) # # [bs, N, N]
+
+            beta = tf.nn.softmax(s, axis=-1)  # attention map
+
+            o = tf.matmul(beta, hw_flatten(h)) # [bs, N, C]
+            gamma = tf.get_variable("gamma", [1], initializer=tf.constant_initializer(0.0))
+
+            o = tf.reshape(o, shape=x.shape) # [bs, h, w, C]
+            x = gamma * o + x
+
+        return x
+
+def generator(self, z, is_training=True, reuse=False):
+        with tf.variable_scope("generator", reuse=reuse):
+            ch = 1024
+            x = deconv(z, channels=ch, kernel=4, stride=1, padding='VALID', use_bias=False, sn=self.sn, scope='deconv')
+            x = batch_norm(x, is_training, scope='batch_norm')
+            x = relu(x)
+
+            for i in range(self.layer_num // 2):
+                if self.up_sample:
+                    x = up_sample(x, scale_factor=2)
+                    x = conv(x, channels=ch // 2, kernel=3, stride=1, pad=1, sn=self.sn, scope='up_conv_' + str(i))
+                    x = batch_norm(x, is_training, scope='batch_norm_' + str(i))
+                    x = relu(x)
+
+                else:
+                    x = deconv(x, channels=ch // 2, kernel=4, stride=2, use_bias=False, sn=self.sn, scope='deconv_' + str(i))
+                    x = batch_norm(x, is_training, scope='batch_norm_' + str(i))
+                    x = relu(x)
+
+                ch = ch // 2
+
+            # Self Attention
+            x = self.attention(x, ch, sn=self.sn, scope="attention", reuse=reuse)
+
+            for i in range(self.layer_num // 2, self.layer_num):
+                if self.up_sample:
+                    x = up_sample(x, scale_factor=2)
+                    x = conv(x, channels=ch // 2, kernel=3, stride=1, pad=1, sn=self.sn, scope='up_conv_' + str(i))
+                    x = batch_norm(x, is_training, scope='batch_norm_' + str(i))
+                    x = relu(x)
+
+                else:
+                    x = deconv(x, channels=ch // 2, kernel=4, stride=2, use_bias=False, sn=self.sn, scope='deconv_' + str(i))
+                    x = batch_norm(x, is_training, scope='batch_norm_' + str(i))
+                    x = relu(x)
+
+                ch = ch // 2
+
+
+            if self.up_sample:
+                x = up_sample(x, scale_factor=2)
+                x = conv(x, channels=self.c_dim, kernel=3, stride=1, pad=1, sn=self.sn, scope='G_conv_logit')
+                x = tanh(x)
+
+            else:
+                x = deconv(x, channels=self.c_dim, kernel=4, stride=2, use_bias=False, sn=self.sn, scope='G_deconv_logit')
+                x = tanh(x)
+
+            return x
+
+def discriminator(self, x, is_training=True, reuse=False):
+        with tf.variable_scope("discriminator", reuse=reuse):
+            ch = 64
+            x = conv(x, channels=ch, kernel=4, stride=2, pad=1, sn=self.sn, use_bias=False, scope='conv')
+            x = lrelu(x, 0.2)
+
+            for i in range(self.layer_num // 2):
+                x = conv(x, channels=ch * 2, kernel=4, stride=2, pad=1, sn=self.sn, use_bias=False, scope='conv_' + str(i))
+                x = batch_norm(x, is_training, scope='batch_norm' + str(i))
+                x = lrelu(x, 0.2)
+
+                ch = ch * 2
+
+            # Self Attention
+            x = self.attention(x, ch, sn=self.sn, scope="attention", reuse=reuse)
+
+            for i in range(self.layer_num // 2, self.layer_num):
+                x = conv(x, channels=ch * 2, kernel=4, stride=2, pad=1, sn=self.sn, use_bias=False, scope='conv_' + str(i))
+                x = batch_norm(x, is_training, scope='batch_norm' + str(i))
+                x = lrelu(x, 0.2)
+
+                ch = ch * 2
+
+
+            x = conv(x, channels=4, stride=1, sn=self.sn, use_bias=False, scope='D_logit')
+
+            return x
+
+
+
+GC-Net--------------------------------------------------------------------------------------------------------------------------------------------------------
+def last_zero_init(m):
+    if isinstance(m, nn.Sequential):
+        constant_init(m[-1], val=0)
+        m[-1].inited = True
+    else:
+        constant_init(m, val=0)
+        m.inited = True
+
+
+class ContextBlock2d(nn.Module):
+
+    def __init__(self, inplanes, planes, pool, fusions):
+        super(ContextBlock2d, self).__init__()
+        assert pool in ['avg', 'att']
+        assert all([f in ['channel_add', 'channel_mul'] for f in fusions])
+        assert len(fusions) > 0, 'at least one fusion should be used'
+        self.inplanes = inplanes
+        self.planes = planes
+        self.pool = pool
+        self.fusions = fusions
+        if 'att' in pool:
+            self.conv_mask = nn.Conv2d(inplanes, 1, kernel_size=1)
+            self.softmax = nn.Softmax(dim=2)
+        else:
+            self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        if 'channel_add' in fusions:
+            self.channel_add_conv = nn.Sequential(
+                nn.Conv2d(self.inplanes, self.planes, kernel_size=1),
+                nn.LayerNorm([self.planes, 1, 1]),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.planes, self.inplanes, kernel_size=1)
+            )
+        else:
+            self.channel_add_conv = None
+        if 'channel_mul' in fusions:
+            self.channel_mul_conv = nn.Sequential(
+                nn.Conv2d(self.inplanes, self.planes, kernel_size=1),
+                nn.LayerNorm([self.planes, 1, 1]),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(self.planes, self.inplanes, kernel_size=1)
+            )
+        else:
+            self.channel_mul_conv = None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if self.pool == 'att':
+            kaiming_init(self.conv_mask, mode='fan_in')
+            self.conv_mask.inited = True
+
+        if self.channel_add_conv is not None:
+            last_zero_init(self.channel_add_conv)
+        if self.channel_mul_conv is not None:
+            last_zero_init(self.channel_mul_conv)
+
+    def spatial_pool(self, x):
+        batch, channel, height, width = x.size()
+        if self.pool == 'att':
+            input_x = x
+            # [N, C, H * W]
+            input_x = input_x.view(batch, channel, height * width)
+            # [N, 1, C, H * W]
+            input_x = input_x.unsqueeze(1)
+            # [N, 1, H, W]
+            context_mask = self.conv_mask(x)
+            # [N, 1, H * W]
+            context_mask = context_mask.view(batch, 1, height * width)
+            # [N, 1, H * W]
+            context_mask = self.softmax(context_mask)
+            # [N, 1, H * W, 1]
+            context_mask = context_mask.unsqueeze(3)
+            # [N, 1, C, 1]
+            context = torch.matmul(input_x, context_mask)
+            # [N, C, 1, 1]
+            context = context.view(batch, channel, 1, 1)
+        else:
+            # [N, C, 1, 1]
+            context = self.avg_pool(x)
+
+        return context
+
+    def forward(self, x):
+        # [N, C, 1, 1]
+        context = self.spatial_pool(x)
+
+        if self.channel_mul_conv is not None:
+            # [N, C, 1, 1]
+            channel_mul_term = torch.sigmoid(self.channel_mul_conv(context))
+            out = x * channel_mul_term
+        else:
+            out = x
+        if self.channel_add_conv is not None:
+            # [N, C, 1, 1]
+            channel_add_term = self.channel_add_conv(context)
+            out = out + channel_add_term
+
+        return out
